@@ -13,10 +13,12 @@ public struct WaveformView<Content: View>: View {
     @State private var samples: [Float] = []
     @State private var rescaleTimer: Timer?
     @State private var currentSize: CGSize = .zero
+    @State private var currentTask: Task<Void, Never>?
+    @State private var currentAudioURL: URL?
 
     /**
      Creates a new WaveformView which displays a waveform for the audio at `audioURL`.
-
+    
      - Parameters:
         - audioURL: The `URL` of the audio asset to be rendered.
         - configuration: The `Waveform.Configuration` to be used for rendering.
@@ -26,7 +28,9 @@ public struct WaveformView<Content: View>: View {
      */
     public init(
         audioURL: URL,
-        configuration: Waveform.Configuration = Waveform.Configuration(damping: .init(percentage: 0.125, sides: .both)),
+        configuration: Waveform.Configuration = Waveform.Configuration(
+            damping: .init(percentage: 0.125, sides: .both)
+        ),
         renderer: WaveformRenderer = LinearWaveformRenderer(),
         priority: TaskPriority = .userInitiated,
         @ViewBuilder content: @escaping (WaveformShape) -> Content
@@ -40,32 +44,103 @@ public struct WaveformView<Content: View>: View {
 
     public var body: some View {
         GeometryReader { geometry in
-            content(WaveformShape(samples: samples, configuration: configuration, renderer: renderer))
-                .onAppear {
-                    guard samples.isEmpty else { return }
-                    update(size: geometry.size, url: audioURL, configuration: configuration)
-                }
-                .modifier(OnChange(of: geometry.size, action: { newValue in update(size: newValue, url: audioURL, configuration: configuration, delayed: true) }))
-                .modifier(OnChange(of: audioURL, action: { newValue in update(size: geometry.size, url: audioURL, configuration: configuration) }))
-                .modifier(OnChange(of: configuration, action: { newValue in update(size: geometry.size, url: audioURL, configuration: newValue) }))
+            content(
+                WaveformShape(
+                    samples: samples,
+                    configuration: configuration,
+                    renderer: renderer
+                )
+            )
+            .onAppear {
+                currentSize = geometry.size
+                loadWaveform(audioURL: audioURL, size: geometry.size)
+            }
+            .modifier(
+                OnChange(
+                    of: geometry.size,
+                    action: { newSize in
+                        currentSize = newSize
+                        loadWaveform(audioURL: audioURL, size: newSize)
+                    }
+                )
+            )
+            .modifier(
+                OnChange(
+                    of: audioURL,
+                    action: { newURL in
+                        loadWaveform(audioURL: newURL, size: currentSize)
+                    }
+                )
+            )
+            .modifier(
+                OnChange(
+                    of: configuration,
+                    action: { newConfig in
+                        loadWaveform(audioURL: audioURL, size: currentSize)
+                    }
+                )
+            )
+            .onDisappear {
+                currentTask?.cancel()
+            }
         }
     }
 
-    private func update(size: CGSize, url: URL, configuration: Waveform.Configuration, delayed: Bool = false) {
+    private func loadWaveform(audioURL: URL, size: CGSize) {
+        // Cancel any existing task
+        currentTask?.cancel()
+
+        // Reset samples immediately
+        samples = []
+
+        currentAudioURL = audioURL
+        let samplesNeeded = Int(size.width * configuration.scale)
+
+        currentTask = Task(priority: priority) {
+            do {
+                let samples = try await WaveformAnalyzer().samples(
+                    fromAudioAt: audioURL,
+                    count: samplesNeeded
+                )
+
+                // Only update if still relevant and task not cancelled
+                if !Task.isCancelled && currentAudioURL == audioURL {
+                    await MainActor.run {
+                        self.samples = samples
+                    }
+                }
+            } catch {
+                // Handle error without crashing
+                debugPrint(
+                    "Waveform loading error: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func update(
+        size: CGSize,
+        url: URL,
+        configuration: Waveform.Configuration,
+        delayed: Bool = false
+    ) {
         rescaleTimer?.invalidate()
 
         let updateTask: @Sendable (Timer?) -> Void = { _ in
             Task(priority: .userInitiated) {
                 do {
                     let samplesNeeded = Int(size.width * configuration.scale)
-                    let samples = try await WaveformAnalyzer().samples(fromAudioAt: url, count: samplesNeeded)
+                    let samples = try await WaveformAnalyzer().samples(
+                        fromAudioAt: url,
+                        count: samplesNeeded
+                    )
 
                     await MainActor.run {
                         self.currentSize = size
                         self.samples = samples
                     }
                 } catch {
-                    assertionFailure(error.localizedDescription)
+                    debugPrint(error.localizedDescription)
                 }
             }
         }
