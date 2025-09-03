@@ -118,12 +118,7 @@ public struct WaveformView<Content: View>: View {
         }
     }
 
-    private func update(
-        size: CGSize,
-        url: URL,
-        configuration: Waveform.Configuration,
-        delayed: Bool = false
-    ) {
+    private func update(size: CGSize, url: URL, configuration: Waveform.Configuration, delayed: Bool = false) {
         rescaleTimer?.invalidate()
 
         let updateTask: @Sendable (Timer?) -> Void = { _ in

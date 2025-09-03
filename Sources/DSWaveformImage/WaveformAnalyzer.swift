@@ -11,6 +11,33 @@ import Foundation
 import Accelerate
 import AVFoundation
 
+private actor WaveformProcessingActor {
+    private var currentProcessingCount = 0
+    private let maxConcurrentOperations = 3 // Only allow 1 at a time on macOS 26
+    private var waitingQueue: [CheckedContinuation<Void, Never>] = []
+    
+    func requestProcessingSlot() async {
+        if currentProcessingCount >= maxConcurrentOperations {
+            await withCheckedContinuation { continuation in
+                waitingQueue.append(continuation)
+            }
+        }
+        currentProcessingCount += 1
+    }
+    
+    func releaseProcessingSlot() {
+        currentProcessingCount = max(0, currentProcessingCount - 1)
+        
+        // Wake up next waiting request
+        if !waitingQueue.isEmpty && currentProcessingCount < maxConcurrentOperations {
+            let continuation = waitingQueue.removeFirst()
+            continuation.resume()
+        }
+    }
+}
+
+private let processingActor = WaveformProcessingActor()
+
 struct WaveformAnalysis {
     let amplitudes: [Float]
     let fft: [TempiFFT]?
@@ -25,22 +52,30 @@ public struct WaveformAnalyzer: Sendable {
 
     public init() {}
 
-    /// Calculates the amplitude envelope of the initialized audio asset URL, downsampled to the required `count` amount of samples.
-    /// - Parameter fromAudioAt: local filesystem URL of the audio file to process.
-    /// - Parameter count: amount of samples to be calculated. Downsamples.
-    /// - Parameter qos: QoS of the DispatchQueue the calculations are performed (and returned) on.
+    // 2. In WaveformAnalyzer.swift - Add debug logging to the samples function
     public func samples(fromAudioAt audioAssetURL: URL, count: Int, qos: DispatchQoS.QoSClass = .userInitiated) async throws -> [Float] {
-        try await Task(priority: taskPriority(qos: qos)) {
-            let audioAsset = AVURLAsset(url: audioAssetURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-            let assetReader = try AVAssetReader(asset: audioAsset)
-
-            guard let assetTrack = try await audioAsset.loadTracks(withMediaType: .audio).first else {
-                throw AnalyzeError.emptyTracks
-            }
-
-            return try await waveformSamples(track: assetTrack, reader: assetReader, count: count, fftBands: nil).amplitudes
-        }.value
+        // Request a processing slot to limit concurrency
+        await processingActor.requestProcessingSlot()
+        
+        do {
+            let result = try await Task(priority: taskPriority(qos: qos)) {
+                let audioAsset = AVURLAsset(url: audioAssetURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+                let assetReader = try AVAssetReader(asset: audioAsset)
+                guard let assetTrack = try await audioAsset.loadTracks(withMediaType: .audio).first else {
+                    throw AnalyzeError.emptyTracks
+                }
+                let result = try await waveformSamples(track: assetTrack, reader: assetReader, count: count, fftBands: nil).amplitudes
+                return result
+            }.value
+            
+            await processingActor.releaseProcessingSlot()
+            return result
+        } catch {
+            await processingActor.releaseProcessingSlot()
+            throw error
+        }
     }
+
 
     /// Calculates the amplitude envelope of the initialized audio asset URL, downsampled to the required `count` amount of samples.
     /// - Parameter fromAudioAt: local filesystem URL of the audio file to process.
@@ -71,6 +106,7 @@ fileprivate extension WaveformAnalyzer {
             count requiredNumberOfSamples: Int,
             fftBands: Int?
     ) async throws -> WaveformAnalysis {
+        
         guard requiredNumberOfSamples > 0 else {
             throw AnalyzeError.userError
         }
@@ -84,8 +120,23 @@ fileprivate extension WaveformAnalyzer {
         switch assetReader.status {
         case .completed:
             return analysis
+        case .failed:
+            if let error = assetReader.error {
+                print("🔴 AssetReader error: \(error)")
+            }
+            // Instead of throwing, try to return what we have if we got any samples
+            if !analysis.amplitudes.isEmpty {
+                return analysis
+            }
+            throw AnalyzeError.readerError(assetReader.status)
+        case .cancelled:
+            throw AnalyzeError.readerError(assetReader.status)
         default:
             print("ERROR: reading waveform audio data has failed \(assetReader.status)")
+            // Try to return partial results if available
+            if !analysis.amplitudes.isEmpty {
+                return analysis
+            }
             throw AnalyzeError.readerError(assetReader.status)
         }
     }
@@ -106,57 +157,110 @@ fileprivate extension WaveformAnalyzer {
         let samplesPerFFT = 4096 // ~100ms at 44.1kHz, rounded to closest pow(2) for FFT
 
         assetReader.startReading()
-        while assetReader.status == .reading {
-            let trackOutput = assetReader.outputs.first!
-
-            guard let nextSampleBuffer = trackOutput.copyNextSampleBuffer(),
-                let blockBuffer = CMSampleBufferGetDataBuffer(nextSampleBuffer) else {
-                    break
+        
+        var loopCount = 0
+        let maxLoops = 10000 // Increased limit but still safety net
+        
+        // Process samples in larger batches for better performance
+        let batchProcessingThreshold = samplesPerPixel * 10 // Process when we have enough for 10 pixels
+        
+        while assetReader.status == .reading && loopCount < maxLoops {
+            loopCount += 1
+            
+            guard let trackOutput = assetReader.outputs.first else {
+                break
+            }
+            
+            guard let nextSampleBuffer = trackOutput.copyNextSampleBuffer() else {
+                break
+            }
+            
+            guard let blockBuffer = CMSampleBufferGetDataBuffer(nextSampleBuffer) else {
+                CMSampleBufferInvalidate(nextSampleBuffer)
+                continue
             }
 
             var readBufferLength = 0
             var readBufferPointer: UnsafeMutablePointer<Int8>? = nil
-            CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: &readBufferLength, totalLengthOut: nil, dataPointerOut: &readBufferPointer)
-            sampleBuffer.append(UnsafeBufferPointer(start: readBufferPointer, count: readBufferLength))
-            if fftBands != nil {
-                // don't append data to this buffer unless we're going to use it.
-                sampleBufferFFT.append(UnsafeBufferPointer(start: readBufferPointer, count: readBufferLength))
+            
+            let result = CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: &readBufferLength, totalLengthOut: nil, dataPointerOut: &readBufferPointer)
+            
+            if result != kCMBlockBufferNoErr {
+                CMSampleBufferInvalidate(nextSampleBuffer)
+                continue
             }
+            
+            guard readBufferLength > 0, let pointer = readBufferPointer else {
+                CMSampleBufferInvalidate(nextSampleBuffer)
+                continue
+            }
+            
+            sampleBuffer.append(UnsafeBufferPointer(start: pointer, count: readBufferLength))
+            
+            if fftBands != nil {
+                sampleBufferFFT.append(UnsafeBufferPointer(start: pointer, count: readBufferLength))
+            }
+            
             CMSampleBufferInvalidate(nextSampleBuffer)
 
-            let processedSamples = process(sampleBuffer, from: assetReader, downsampleTo: samplesPerPixel)
-            outputSamples += processedSamples
+            // Only process when we have enough data for efficient batch processing
+            let availableSamples = sampleBuffer.count / MemoryLayout<Int16>.size
+            if availableSamples >= batchProcessingThreshold || assetReader.status != .reading {
+                let processedSamples = process(sampleBuffer, from: assetReader, downsampleTo: samplesPerPixel)
+                outputSamples += processedSamples
 
-            if processedSamples.count > 0 {
-                // vDSP_desamp uses strides of samplesPerPixel; remove only the processed ones
-                sampleBuffer.removeFirst(processedSamples.count * samplesPerPixel * MemoryLayout<Int16>.size)
-
-                // this takes care of a memory leak where Memory continues to increase even though it should clear after calling .removeFirst(…) above.
-                sampleBuffer = Data(sampleBuffer)
+                if processedSamples.count > 0 {
+                    let bytesToRemove = processedSamples.count * samplesPerPixel * MemoryLayout<Int16>.size
+                    if bytesToRemove <= sampleBuffer.count {
+                        sampleBuffer.removeFirst(bytesToRemove)
+                        sampleBuffer = Data(sampleBuffer)
+                    }
+                }
+                
             }
 
             if let fftBands = fftBands, sampleBufferFFT.count / MemoryLayout<Int16>.size >= samplesPerFFT {
                 let processedFFTs = process(sampleBufferFFT, samplesPerFFT: samplesPerFFT, fftBands: fftBands)
-                sampleBufferFFT.removeFirst(processedFFTs.count * samplesPerFFT * MemoryLayout<Int16>.size)
+                let bytesToRemove = processedFFTs.count * samplesPerFFT * MemoryLayout<Int16>.size
+                if bytesToRemove <= sampleBufferFFT.count {
+                    sampleBufferFFT.removeFirst(bytesToRemove)
+                }
                 outputFFT? += processedFFTs
             }
+            
+            // Early exit if we have enough samples
+            if outputSamples.count >= targetSampleCount {
+                break
+            }
         }
-
-        // if we don't have enough pixels yet,
-        // process leftover samples with padding (to reach multiple of samplesPerPixel for vDSP_desamp)
+        
+        // Process any remaining data in the buffer
+        if sampleBuffer.count > 0 && outputSamples.count < targetSampleCount {
+            let remainingProcessed = process(sampleBuffer, from: assetReader, downsampleTo: samplesPerPixel)
+            outputSamples += remainingProcessed
+        }
+        
+        // Handle case where we still don't have enough samples
         if outputSamples.count < targetSampleCount {
             let missingSampleCount = (targetSampleCount - outputSamples.count) * samplesPerPixel
             let backfillPaddingSampleCount = missingSampleCount - (sampleBuffer.count / MemoryLayout<Int16>.size)
-            let backfillPaddingSampleCount16 = backfillPaddingSampleCount * MemoryLayout<Int16>.size
-            let backfillPaddingSamples = [UInt8](repeating: 0, count: backfillPaddingSampleCount16)
-            sampleBuffer.append(backfillPaddingSamples, count: backfillPaddingSampleCount16)
-            let processedSamples = process(sampleBuffer, from: assetReader, downsampleTo: samplesPerPixel)
-            outputSamples += processedSamples
+            
+            if backfillPaddingSampleCount > 0 {
+                let backfillPaddingSampleCount16 = backfillPaddingSampleCount * MemoryLayout<Int16>.size
+                let backfillPaddingSamples = [UInt8](repeating: 0, count: backfillPaddingSampleCount16)
+                sampleBuffer.append(backfillPaddingSamples, count: backfillPaddingSampleCount16)
+                
+                let processedSamples = process(sampleBuffer, from: assetReader, downsampleTo: samplesPerPixel)
+                outputSamples += processedSamples
+            }
         }
 
-        let targetSamples = Array(outputSamples[0..<targetSampleCount])
+        let finalSampleCount = min(targetSampleCount, outputSamples.count)
+        let targetSamples = Array(outputSamples[0..<finalSampleCount])
         return WaveformAnalysis(amplitudes: normalize(targetSamples), fft: outputFFT)
     }
+    
+    
 
     private func process(_ sampleBuffer: Data, from assetReader: AVAssetReader, downsampleTo samplesPerPixel: Int) -> [Float] {
         var downSampledData = [Float]()
@@ -225,14 +329,22 @@ fileprivate extension WaveformAnalyzer {
 
     private func totalSamples(of audioAssetTrack: AVAssetTrack) async throws -> Int {
         var totalSamples = 0
-        let (descriptions, timeRange) = try await audioAssetTrack.load(.formatDescriptions, .timeRange)
+        
+        do {
+            let (descriptions, timeRange) = try await audioAssetTrack.load(.formatDescriptions, .timeRange)
 
-        descriptions.forEach { formatDescription in
-            guard let basicDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else { return }
-            let channelCount = Int(basicDescription.pointee.mChannelsPerFrame)
-            let sampleRate = basicDescription.pointee.mSampleRate
-            totalSamples = Int(sampleRate * timeRange.duration.seconds) * channelCount
+            descriptions.forEach { formatDescription in
+                guard let basicDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+                    return
+                }
+                let channelCount = Int(basicDescription.pointee.mChannelsPerFrame)
+                let sampleRate = basicDescription.pointee.mSampleRate
+                totalSamples = Int(sampleRate * timeRange.duration.seconds) * channelCount
+            }
+        } catch {
+            throw error
         }
+        
         return totalSamples
     }
 }
